@@ -1,0 +1,135 @@
+name: Build and deploy to ACR and ACI
+
+on:
+  push:               # trigger on any push to any branch
+  pull_request:       # trigger on pull requests targeting any branch
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # These must be provided as repository secrets (see README below)
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  FRONTEND_ACI_NAME: ${{ secrets.ACI_FRONTEND_NAME }}
+  BACKEND_ACI_NAME: ${{ secrets.ACI_BACKEND_NAME }}
+  WORKER_ACI_NAME: ${{ secrets.ACI_WORKER_NAME }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+         
+
+      - name: Set image tag
+        run: |
+          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+
+      - name: Build and push portal image to ACR
+        run: |
+          az acr build --registry ${{ secrets.ACR_NAME }} --image portal-backend:$IMAGE_TAG --file portal/backend/Dockerfile portal/backend
+
+      - name: Get ACR credentials
+        id: acrcreds
+        run: |
+          ACR_USER=$(az acr credential show -n ${{ secrets.ACR_NAME }} --query "username" -o tsv)
+          ACR_PASS=$(az acr credential show -n ${{ secrets.ACR_NAME }} --query "passwords[0].value" -o tsv)
+          echo "ACR_USERNAME=$ACR_USER" >> $GITHUB_ENV
+          echo "ACR_PASSWORD=$ACR_PASS" >> $GITHUB_ENV
+
+      - name: Deploy all containers in a single Container Group
+        env:
+          RG: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          GROUP_NAME: ${{ secrets.ACI_FRONTEND_NAME }}
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_NAME }}.azurecr.io
+        run: |
+          set -e
+          echo "Using resource group: $RG"
+          echo "Using container group name: $GROUP_NAME"
+          # delete existing group if present (ignore errors)
+          az container delete -g $RG -n $GROUP_NAME --yes || true
+
+          cat > aci-group.yml <<EOF
+          apiVersion: 2021-09-01
+          location: centralus
+          name: $GROUP_NAME
+          type: Microsoft.ContainerInstance/containerGroups
+          properties:
+            osType: Linux
+            restartPolicy: OnFailure
+            containers:
+              - name: portal-frontend
+                properties:
+                  image: $ACR_LOGIN_SERVER/portal-frontend:$IMAGE_TAG
+                  resources:
+                    requests:
+                      cpu: 0.2
+                      memoryInGb: 0.5
+                  ports:
+                    - port: 80
+                    - port: 443
+              - name: portal-backend
+                properties:
+                  image: $ACR_LOGIN_SERVER/portal-backend:$IMAGE_TAG
+                  resources:
+                    requests:
+                      cpu: 0.4
+                      memoryInGb: 1.0
+                  ports:
+                    - port: 8000
+                  environmentVariables:
+                    - name: MONGO_URI
+                      secureValue: "$MONGO_URI"
+                    - name: OPENAI_API_KEY
+                      secureValue: "$OPENAI_API_KEY"
+              - name: sds-tds-worker
+                properties:
+                  image: $ACR_LOGIN_SERVER/sds-tds-worker:$IMAGE_TAG
+                  resources:
+                    requests:
+                      cpu: 0.4
+                      memoryInGb: 0.5
+                  environmentVariables:
+                    - name: MONGO_URI
+                      secureValue: "$MONGO_URI"
+                    - name: OPENAI_API_KEY
+                      secureValue: "$OPENAI_API_KEY"
+            ipAddress:
+              type: Public
+              dnsNameLabel: "${GROUP_NAME}-mvs360-unique"
+              ports:
+                - protocol: TCP
+                  port: 80
+                - protocol: TCP
+                  port: 443
+                - protocol: TCP
+                  port: 8000
+            imageRegistryCredentials:
+              - server: $ACR_LOGIN_SERVER
+                username: $ACR_USERNAME
+                password: $ACR_PASSWORD         
+          EOF
+          echo "--- aci-group.yml file content: ---"
+          cat aci-group.yml
+          echo "-----------------------------------"
+          # Verify YAML is valid
+
+
+          az container create -g $RG --file aci-group.yml
+
+      - name: Show Container Group FQDN
+        env:
+          RG: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          GROUP_NAME: ${{ secrets.ACI_FRONTEND_NAME }}
+        run: |
+          echo "Container Group FQDN:"; az container show -g $RG -n $GROUP_NAME --query "ipAddress.fqdn" -o tsv || true
